@@ -5,6 +5,7 @@ import type { SessionUpdate, ToolCallContent } from '@agentclientprotocol/sdk'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-token-meter'
 import { assistantBlockToAcp } from './content.ts'
+import type { WriteDraftIncrement } from './write-draft-stream.ts'
 
 /**
  * Convert one committed assistant message and its context usage in block order.
@@ -81,6 +82,23 @@ export async function toolResultUpdate(
     toolCallId: result.toolCallId,
     status: result.isError === true ? 'failed' : 'completed',
     content,
+  }
+}
+
+/**
+ * In-progress content increment for a markdown Write (TASK-828).
+ * `content` is a suffix; hosts concatenate by `rawInput.seq`.
+ */
+export function toolCallProgressUpdate(
+  toolCallId: string,
+  increment: WriteDraftIncrement,
+): SessionUpdate {
+  return {
+    sessionUpdate: 'tool_call_update',
+    toolCallId,
+    status: 'in_progress',
+    rawInput: { file_path: increment.path, seq: increment.seq },
+    content: [{ type: 'content', content: { type: 'text', text: increment.delta } }],
   }
 }
 

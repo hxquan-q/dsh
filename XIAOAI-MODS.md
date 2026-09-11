@@ -21,3 +21,4 @@
 | 5 | `acp-app` bundle 挂载 xiaoai 插件 | `packages/bundle/acp-app/cordis.patch.yml:8-13` | ACP profile 默认启用 xiaoai-llm/xiaoai-infra | 否 |
 | 6 | `dsh-base` / `sdk-runtime` 闭包依赖 | `packages/bundle/base/package.json`、`python/sdk-runtime/package.json` | 运行镜像 deploy 携带 xiaoai 包 | 否 |
 | 7 | `tsdown` workspace 纳入 xiaoai 包 | `tsdown.config.ts:19` | 否则只产出 `lib/types/*.d.ts`，ACP 启动 `ERR_MODULE_NOT_FOUND`（TASK-656 现场） | 否 |
+| 8 | Write 参数流式进 ACP `tool_call_update` in_progress | 新文件 `packages/acp/acp/src/write-draft-stream.ts`；`updates.ts` `toolCallProgressUpdate`；`session.ts` `onSessionEvent` 截获 `assistant/chunk`/`tool-call-delta` | TASK-828：md Write 边生成边上报 content 后缀；Edit / 非 md 不发 | 否（平台 Canvas 私有） |

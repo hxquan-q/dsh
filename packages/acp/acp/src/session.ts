@@ -17,7 +17,8 @@ import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { mountAcpMcpServers } from './mcp.ts'
 import { AcpModelControl } from './model-control.ts'
-import { assistantUpdates, toolCallUpdate, toolResultUpdate } from './updates.ts'
+import { assistantUpdates, toolCallProgressUpdate, toolCallUpdate, toolResultUpdate } from './updates.ts'
+import { WriteDraftStreamer } from './write-draft-stream.ts'
 
 /** The continuable-subagent teardown used without depending on the subagent package. */
 interface ContinuableDrain {
@@ -103,6 +104,8 @@ export class AcpSession {
   private inflight: InflightPrompt | undefined
   private closing: Promise<void> | undefined
   private readonly pendingSelections = new Map<string, ModelSelection>()
+  /** Per-call Write argument streamers (TASK-828). Cleared on tool/call or tool/result. */
+  private readonly writeDrafts = new Map<string, WriteDraftStreamer>()
 
   private constructor(
     private readonly ctx: Context,
@@ -360,7 +363,30 @@ export class AcpSession {
           if (inflight !== undefined) inflight.outputError ??= failure
           this.ctx.logger.warn(`acp: assistant output conversion failed: ${errorChain(error)}`)
         })
+      } else if (event.type === 'assistant/chunk' && event.data.chunk.type === 'tool-call-delta') {
+        const chunk = event.data.chunk
+        const callId = chunk.id
+        let streamer = this.writeDrafts.get(callId)
+        if (streamer === undefined) {
+          streamer = new WriteDraftStreamer()
+          this.writeDrafts.set(callId, streamer)
+        }
+        const increment = streamer.push(chunk.name, chunk.argumentsDelta)
+        if (increment !== undefined) {
+          const previous = this.outputTail
+          this.outputTail = previous
+            .then(() => this.notify({
+              sessionId: this.agent.session.id,
+              update: toolCallProgressUpdate(callId, increment),
+            }))
+            /* v8 ignore start -- the bridge notifier contains transport rejection. */
+            .catch((error: unknown) => {
+              this.ctx.logger.warn(`acp: write-draft increment delivery failed: ${errorChain(error)}`)
+            })
+            /* v8 ignore stop */
+        }
       } else if (event.type === 'tool/call') {
+        this.writeDrafts.delete(event.data.callId)
         const previous = this.outputTail
         this.outputTail = previous
           .then(() => this.notify({ sessionId: this.agent.session.id, update: toolCallUpdate(event) }))
@@ -370,6 +396,8 @@ export class AcpSession {
           })
         /* v8 ignore stop */
       } else if (event.type === 'tool/result') {
+        const result = event.data.message.content[0]
+        if (result !== undefined) this.writeDrafts.delete(result.toolCallId)
         const previous = this.outputTail
         this.outputTail = previous
           .then(async () => this.notify({

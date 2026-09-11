@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { ToolCallId, MessageId } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
-import { assistantUpdates, toolCallUpdate, toolResultUpdate } from '../src/updates.ts'
+import { assistantUpdates, toolCallProgressUpdate, toolCallUpdate, toolResultUpdate } from '../src/updates.ts'
 
 /** Minimal committed assistant event for pure update projection tests. */
 function assistantEvent(
@@ -88,6 +88,16 @@ describe('standard ACP update projection', () => {
       toolCallId: 'call-bad',
       status: 'failed',
       content: [],
+    })
+  })
+
+  it('projects an in_progress write increment with seq and suffix text', () => {
+    expect(toolCallProgressUpdate('call-w', { path: 'report.md', seq: 2, delta: '## 节' })).toEqual({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call-w',
+      status: 'in_progress',
+      rawInput: { file_path: 'report.md', seq: 2 },
+      content: [{ type: 'content', content: { type: 'text', text: '## 节' } }],
     })
   })
 })
