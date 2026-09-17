@@ -1,5 +1,6 @@
 # xiaoai 魔改登记表（升级 replay 唯一依据）
 
+- xiaoai 锚点：tag `dsh-upstream-0.1.6-alpha.1-xiaoai`（`65fcce4c20` = 上游 0.1.6-alpha.1 + 本表 9 项补丁 + flock bin 占位）
 - 上游锚点：tag `dsh-v0.1.6-alpha.1`（入仓时的纯净树，零魔改）
 - 上游版本：@deepseek-ai/dsh 0.1.6-alpha.1（tag `0a15e36e7f82b6ed45af6fa9759f29b40dcd965d`）
 - 上一锚点：tag `dsh-upstream-0.1.2-alpha.4`（`4e84901e6471b79ec0338099867ebb4606d12bb5`）
@@ -16,6 +17,13 @@
 - **patch #4 `mcp-client/transport.ts`**：上游 `489c3ac715` 整体换成官方 SDK（`@modelcontextprotocol/client`）并删去 `as Transport` 转型。`resolveHeaderEnv` 主体照旧，仅贴到新 import 形态上；`createTransport` 每代重读 `process.env`（`buildChildEnv` 只影响 stdio 子进程 env，不影响 streamable-http header 插值）。
 - **patch #8 `acp/session.ts` 接线点重做**：上游删除 `assistant/chunk` session 事件（raw chunk 并入 `assistant/message.stream`），新增 `agent/assistant-stream` 派发事件。`WriteDraftStreamer` 主体不变；`session.ts` 从 `onSessionEvent` 截获 `assistant/chunk` 改为新增 `onAssistantStream(frame)` 截获 `agent/assistant-stream` 的 `chunk` 帧（`frame.chunk.type === 'tool-call-delta'`）；`updates.ts` `toolCallProgressUpdate` 不变；`index.ts` 新增 `ctx.on('agent/assistant-stream', ...)` 派发。TASK-882 的文本/思考增量投影仍在上游未做，不受此改动影响。
 - **patch #9（本锚点补登记）`repeat-tool-reminder` stop 档**：上一锚点该改动已存在但漏登记（ADR-0033 已记载）。上游 `src/index.ts` 0.1.2→0.1.6 零变化，`stopAfter` veto 逻辑照旧；tests/README 因上游 `ctx.agentLoop.create` 改 async 而适配。
+
+## 0.1.6-alpha.1 部署面修复（主仓 docker/，2026-09-17 实测）
+
+- **flock 原生 addon 必须预构建**：上游 session 持久化改为内核 flock（`@deepseek-ai/node-addon-system-<plat>` 平台包 `bin/glibc/system.node`）。该包是 `native/system` workspace 包，`pnpm deploy` 对 link 依赖只拷 `package.json` 不带 `bin/`，运行镜像 session flush 即炸（e2e 现场 `Cannot find module .../system.node` → D0004）。构建前在源码树跑 `native/system/scripts/build.ts --host-addon-only`（gcc/make，Node 带 dev headers；musl-gcc 缺失只跳 landlock 静态件，不阻塞），主仓 `restore-hoists.cjs` 已补 bin 补拷。`bin/glibc/.gitkeep` 占位已入库（git 不跟踪空目录）。
+- **corepack 锁 pnpm 11**：0.1.6 上游 `packageManager` 升 pnpm 11，构建期 `corepack prepare pnpm@11.7.0 --activate` 显式锁定，避免插件 profile 安装时二次解析漂移。
+- **deploy 容忍 unused patch**：`@electron/osx-sign` patch 不在 runtime 闭包（上游官方脚本同样带 `--config.allow-unused-patches=true`），deploy 需同参数。
+- **Landlock 路径迁移**：上游 `336ebb235e` 把 `native/landlock-run` 迁至 `native/system`；主仓 `check-dsh-src.sh` 已改两路径任一存在即可。
 
 ## 登记表
 
