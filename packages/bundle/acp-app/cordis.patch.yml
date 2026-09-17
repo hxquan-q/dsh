@@ -6,6 +6,12 @@
     personaPrefix: >-
       You are a coding agent powered by the {{model}} model.
 
+- insert:
+    - id: xiaoai-infra
+      name: 'xiaoai-infra'
+    - id: xiaoai-llm
+      name: 'xiaoai-llm'
+
 - id: session-title-llm
   disabled: true
 

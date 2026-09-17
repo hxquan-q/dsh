@@ -10,14 +10,15 @@ import {
   type SessionNotification,
   type StopReason,
 } from '@agentclientprotocol/sdk'
-import type { Agent, AgentHandle, AgentOptions, ModelSelection } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, AgentOptions, AssistantStreamFrame, ModelSelection } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, errorChain, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { type Session, type SessionEvent, type SessionId, type TurnEndReason } from '@deepseek-ai/dsh-session'
 import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { mountAcpMcpServers } from './mcp.ts'
 import { AcpModelControl } from './model-control.ts'
-import { assistantUpdates, toolCallUpdate, toolResultUpdate } from './updates.ts'
+import { assistantUpdates, toolCallProgressUpdate, toolCallUpdate, toolResultUpdate } from './updates.ts'
+import { WriteDraftStreamer } from './write-draft-stream.ts'
 
 /** The continuable-subagent teardown used without depending on the subagent package. */
 interface ContinuableDrain {
@@ -103,6 +104,8 @@ export class AcpSession {
   private inflight: InflightPrompt | undefined
   private closing: Promise<void> | undefined
   private readonly pendingSelections = new Map<string, ModelSelection>()
+  /** Per-call Write argument streamers (TASK-828). Cleared on tool/call or tool/result. */
+  private readonly writeDrafts = new Map<string, WriteDraftStreamer>()
 
   private constructor(
     private readonly ctx: Context,
@@ -358,6 +361,7 @@ export class AcpSession {
           this.ctx.logger.warn(`acp: assistant output conversion failed: ${errorChain(error)}`)
         })
       } else if (event.type === 'tool/call') {
+        this.writeDrafts.delete(event.data.callId)
         const previous = this.outputTail
         this.outputTail = previous
           .then(() => this.notify({ sessionId: this.agent.session.id, update: toolCallUpdate(event) }))
@@ -367,6 +371,8 @@ export class AcpSession {
           })
         /* v8 ignore stop */
       } else if (event.type === 'tool/result') {
+        const result = event.data.message.content[0]
+        if (result !== undefined) this.writeDrafts.delete(result.toolCallId)
         const previous = this.outputTail
         this.outputTail = previous
           .then(async () => this.notify({
@@ -386,6 +392,36 @@ export class AcpSession {
       }
       if (event.type === 'turn/end') this.modelControl.releaseTurn(event.data.turn)
     }
+  }
+
+  /**
+   * Project one transient assistant-stream frame (TASK-828 / xiaoai).
+   * `agent/assistant-stream` replaced the removed `assistant/chunk` session
+   * event; only `tool-call-delta` frames feed the per-call Write draft streamer.
+   * @param frame - agent-scoped assistant-stream frame.
+   */
+  onAssistantStream(frame: AssistantStreamFrame): void {
+    if (frame.type !== 'chunk' || frame.chunk.type !== 'tool-call-delta') return
+    const chunk = frame.chunk
+    const callId = chunk.id
+    let streamer = this.writeDrafts.get(callId)
+    if (streamer === undefined) {
+      streamer = new WriteDraftStreamer()
+      this.writeDrafts.set(callId, streamer)
+    }
+    const increment = streamer.push(chunk.name, chunk.argumentsDelta)
+    if (increment === undefined) return
+    const previous = this.outputTail
+    this.outputTail = previous
+      .then(() => this.notify({
+        sessionId: this.agent.session.id,
+        update: toolCallProgressUpdate(callId, increment),
+      }))
+      /* v8 ignore start -- the bridge notifier contains transport rejection. */
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(`acp: write-draft increment delivery failed: ${errorChain(error)}`)
+      })
+      /* v8 ignore stop */
   }
 
   /**

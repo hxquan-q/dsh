@@ -3,6 +3,10 @@
  * plugin's resolved config. Stdio spawns a child process (with credential
  * scrubbing); Streamable HTTP connects to a URL.
  *
+ * XIAOAI fork: Streamable HTTP header values support `${ENV_VAR}` references,
+ * resolved at transport creation so each connection generation picks up a
+ * rotated session token (registered in XIAOAI-MODS.md).
+ *
  * @module
  */
 
@@ -23,6 +27,26 @@ function buildChildEnv(extra: Record<string, string>): Record<string, string> {
 }
 
 /**
+ * XIAOAI fork: expand `${ENV_VAR}` references in header values from the
+ * process environment. Unresolvable references are dropped with a warning
+ * rather than sent literally — a literal `${...}` in an Authorization header
+ * is always a misconfiguration leaking its shape to the server.
+ * @param headers - configured headers, values possibly containing `${VAR}`.
+ * @returns headers with references resolved; unresolvable entries omitted.
+ */
+function resolveHeaderEnv(headers: Record<string, string>): Record<string, string> {
+  const resolved: Record<string, string> = {}
+  for (const [name, value] of Object.entries(headers)) {
+    const expanded = value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (whole, name_) => {
+      return process.env[name_] ?? whole
+    })
+    if (expanded.includes('${')) continue
+    resolved[name] = expanded
+  }
+  return resolved
+}
+
+/**
  * Create an MCP transport from the resolved plugin config.
  *
  * @param config - Resolved plugin config discriminated on `transport`.
@@ -40,7 +64,7 @@ export function createTransport(config: Config): Transport {
     case 'streamable-http':
       return new StreamableHTTPClientTransport(
         new URL(config.url),
-        { requestInit: { headers: config.headers } },
+        { requestInit: { headers: resolveHeaderEnv(config.headers) } },
       )
   }
 }

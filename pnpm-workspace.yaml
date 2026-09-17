@@ -13,6 +13,9 @@ packages:
   # Deploy root of the single-exe build: a pure dependency manifest whose
   # closure is what the exe bundles and what the Python runtime distributes.
   - python/sdk-runtime
+  # xiaoai 平台 fork 包（TASK-648）
+  - xiaoai-llm
+  - xiaoai-infra
 
 overrides:
   '@deepseek-ai/cosmokit': 'link:vendor/cosmokit'

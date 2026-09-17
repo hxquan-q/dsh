@@ -1,8 +1,9 @@
 /**
- * Advisory per-agent repeat-call detector. It enriches post-execute decisions
- * with logged model context without vetoing or rewriting calls. Configuration
- * and chain semantics live in the package README; rationale lives in the
- * repeat-tool-reminder Agent Note.
+ * Per-agent repeat-call detector. Below `stopAfter` it enriches post-execute
+ * decisions with logged model context; at `stopAfter` and beyond it vetoes the
+ * identical call (`PostToolDecision` `block`) and injects plugin-sourced stop
+ * text so the loop can still conclude. Configuration and chain semantics live
+ * in the package README; rationale lives in the repeat-tool stop-gate Agent Note.
  * @module @deepseek-ai/dsh-repeat-tool-reminder
  */
 
@@ -19,31 +20,39 @@ export const name = 'repeat-tool-reminder'
 /**
  * Plugin config, validated by the same-named schemastery schema plus the
  * load-time checks in `apply` (misconfiguration fails loud: an empty
- * `thresholds` list, a non-integer, a value below 2, or a duplicate throws at
- * plugin load, never a silent fall-back). `include`/`exclude` entries are
- * `*`-wildcard predicates over tool names at call time, not references to
- * registry entries — a pattern matching no currently registered tool is valid
- * (`exclude: [mcp_*]` must stay legal in a deployment that loads no MCP tools).
+ * `thresholds` list, a non-integer threshold or `stopAfter`, a value below 2,
+ * or a duplicate threshold throws at plugin load, never a silent fall-back).
+ * `include`/`exclude` entries are `*`-wildcard predicates over tool names at
+ * call time, not references to registry entries — a pattern matching no
+ * currently registered tool is valid (`exclude: [mcp_*]` must stay legal in a
+ * deployment that loads no MCP tools).
  */
 export interface Config {
   /** Consecutive-repeat counts that trigger a reminder (default `[3, 5, 8]`). */
   thresholds?: number[]
+  /**
+   * Consecutive-repeat count at which this plugin vetoes the identical call
+   * (default: the last `thresholds` entry). Every later identical call is also
+   * vetoed. Reminder thresholds at or above this count never fire as reminders.
+   */
+  stopAfter?: number
   /** Tool-name patterns to track; empty means every tool is tracked. */
   include?: string[]
   /** Tool-name patterns transparent to the chain (neither count nor reset). */
   exclude?: string[]
   /**
    * Maximum characters of canonical arguments quoted in the DETAILED reminder
-   * (default 500). Large payloads (a `write` body, a long command) would
-   * otherwise ride into the next request unbounded — precisely in a loop
-   * scenario; the cap bounds the reminder, never the detection (the chain key
-   * always compares the FULL canonical string).
+   * and the stop notice (default 500). Large payloads (a `write` body, a long
+   * command) would otherwise ride into the next request unbounded — precisely
+   * in a loop scenario; the cap bounds the model-visible text, never the
+   * detection (the chain key always compares the FULL canonical string).
    */
   argumentsPreviewChars?: number
 }
 
 export const Config: z<Config> = z.object({
   thresholds: z.array(z.number()).default([3, 5, 8]),
+  stopAfter: z.number(),
   include: z.array(z.string()).default([]),
   exclude: z.array(z.string()).default([]),
   argumentsPreviewChars: z.number().default(500),
@@ -76,6 +85,22 @@ function detailedReminder(toolName: string, count: number, canonicalArguments: s
     + 'these exact arguments again. Inspect the latest result and choose a '
     + 'different action, different arguments, or finish the task if enough '
     + 'evidence has been gathered.'
+}
+
+/**
+ * The stop-tier notice. Delivered as plugin-sourced additional context AND as
+ * `block` feedback so the model sees both the injected message and an error
+ * tool result. It does not mention other guards, approvals, or loop halt.
+ */
+function stopNotice(toolName: string, count: number, canonicalArguments: string): string {
+  return 'Repeated tool call blocked:\n'
+    + `- tool: ${toolName}\n`
+    + `- consecutive_calls: ${count}\n`
+    + `- arguments: ${canonicalArguments}\n`
+    + 'This identical call was blocked because it made no progress. Do not '
+    + 'retry this tool with these exact arguments. Inspect prior results and '
+    + 'take a different action, or finish the task if enough evidence has '
+    + 'been gathered.'
 }
 
 /**
@@ -154,6 +179,13 @@ interface Chain {
   count: number
 }
 
+/** Reminder or stop-tier output for one tracked post-execute observation. */
+interface Observation {
+  context: UserMessage
+  /** Present only at `stopAfter` and beyond; becomes `block.feedback`. */
+  stopFeedback?: { type: 'text'; text: string }[]
+}
+
 /**
  * Install the guard's listeners.
  * @param ctx - plugin context; listeners are scoped to it and disposed with it.
@@ -163,6 +195,16 @@ export function apply(ctx: Context, config: Config): void {
   // schemastery's .default() guarantees the fields are set after validation.
   const thresholds = validateThresholds(config.thresholds as number[])
   const thresholdSet = new Set(thresholds)
+  const lastThreshold = thresholds.at(-1)
+  if (lastThreshold === undefined) {
+    // Unreachable: validateThresholds throws on an empty list; kept so the
+    // default derives from a proven non-empty array without a non-null assertion.
+    throw new Error('repeat-tool-reminder: `thresholds` must not be empty')
+  }
+  const stopAfter = config.stopAfter ?? lastThreshold
+  if (!Number.isInteger(stopAfter) || stopAfter < 2) {
+    throw new Error(`repeat-tool-reminder: invalid stopAfter ${stopAfter} — must be an integer >= 2`)
+  }
   const includePatterns = (config.include as string[]).map(wildcardToRegExp)
   const excludePatterns = (config.exclude as string[]).map(wildcardToRegExp)
   const argumentsPreviewChars = config.argumentsPreviewChars as number
@@ -180,13 +222,12 @@ export function apply(ctx: Context, config: Config): void {
 
   /**
    * Advance the calling agent's chain for one attempt and return the reminder
-   * to deliver, if this attempt's run length hits a configured threshold.
-   * Counting happens here — in post-execute — because denied calls also flow
-   * through this waterfall (`ToolRuntime.execute` routes a deny through the
-   * same pipeline), and a model hammering a denied call is exactly the loop
-   * worth breaking.
+   * or stop notice to deliver. Counting happens here — in post-execute —
+   * because denied calls also flow through this waterfall
+   * (`ToolRuntime.execute` routes a deny through the same pipeline), and a
+   * model hammering a denied call is exactly the loop worth breaking.
    */
-  function observe(exec: ToolExecution): UserMessage | undefined {
+  function observe(exec: ToolExecution): Observation | undefined {
     // A direct `ctx.tools.execute()` caller has no model to remind and no id
     // to key on; only agent-loop calls participate.
     if (!exec.agent) return undefined
@@ -196,30 +237,52 @@ export function apply(ctx: Context, config: Config): void {
     const chain = chains.get(exec.agent)
     const count = chain !== undefined && chain.key === key ? chain.count + 1 : 1
     chains.set(exec.agent, { key, count })
+    const preview = previewArguments(canonical, argumentsPreviewChars)
+    if (count >= stopAfter) {
+      const text = stopNotice(exec.name, count, preview)
+      return {
+        context: createUserMessage({
+          content: [{ type: 'text', text }],
+          source: { ...PLUGIN_SOURCE, form: 'notice', summary: `${exec.name} × ${count}` },
+        }),
+        stopFeedback: [{ type: 'text', text }],
+      }
+    }
     if (!thresholdSet.has(count)) return undefined
     const text = count === thresholds[0]
       ? GENTLE_REMINDER
-      : detailedReminder(exec.name, count, previewArguments(canonical, argumentsPreviewChars))
-    return createUserMessage({
-      content: [{ type: 'text', text }],
-      source: { ...PLUGIN_SOURCE, form: 'notice', summary: `${exec.name} × ${count}` },
-    })
+      : detailedReminder(exec.name, count, preview)
+    return {
+      context: createUserMessage({
+        content: [{ type: 'text', text }],
+        source: { ...PLUGIN_SOURCE, form: 'notice', summary: `${exec.name} × ${count}` },
+      }),
+    }
   }
 
-  // Observe-and-enrich, never veto: count first (state advances regardless of
-  // the downstream outcome), DELEGATE so a later listener can still block or
-  // replace, then fold the reminder onto whatever came back — additionalContexts
-  // rides both decision variants, so a blocked call still gets the nudge.
+  // Count first (state advances regardless of the downstream outcome), DELEGATE
+  // so a later listener can still block or replace, then fold the reminder onto
+  // whatever came back — or replace the decision with `block` at stopAfter.
+  // additionalContexts rides both decision variants, so a blocked call still
+  // gets the nudge. Stop never skips HITL or other guards: it only vetoes this
+  // repeated tool result after `next()`.
   ctx.on('tools/post-execute', async (exec, _result, next): Promise<PostToolDecision> => {
-    const reminder = observe(exec)
+    const observation = observe(exec)
     const downstream = await next()
-    if (!reminder) return downstream
+    if (!observation) return downstream
+    if (observation.stopFeedback) {
+      return {
+        kind: 'block',
+        feedback: observation.stopFeedback,
+        additionalContexts: prependContext(observation.context, downstream.additionalContexts),
+      }
+    }
     if (downstream.kind === 'block') {
-      return { kind: 'block', feedback: downstream.feedback, additionalContexts: prependContext(reminder, downstream.additionalContexts) }
+      return { kind: 'block', feedback: downstream.feedback, additionalContexts: prependContext(observation.context, downstream.additionalContexts) }
     }
     return {
       ...downstream,
-      additionalContexts: prependContext(reminder, downstream.additionalContexts),
+      additionalContexts: prependContext(observation.context, downstream.additionalContexts),
     }
   })
 

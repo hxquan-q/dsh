@@ -54,6 +54,16 @@ const guardSource = (tool: string, count: number) => ({
   summary: `${tool} × ${count}`,
 })
 
+function toolResults(agent: Agent): SessionEvent<'tool/result'>[] {
+  return agent.session.snapshotEvents().filter((e): e is SessionEvent<'tool/result'> => e.type === 'tool/result')
+}
+
+function lastToolIsError(agent: Agent): boolean {
+  const results = toolResults(agent)
+  const last = results[results.length - 1]
+  return last !== undefined && last.data.message.content[0].isError === true
+}
+
 describe('threshold escalation', () => {
   it('reminds gently at the first default threshold (3) and in detail at the second (5)', async () => {
     const ctx = await harness()
@@ -76,8 +86,70 @@ describe('threshold escalation', () => {
     expect(found[1]!.source).toEqual(guardSource('probe', 5))
   })
 
+  it('vetoes at the default stopAfter (8) after reminding at 3 and 5', async () => {
+    const ctx = await harness()
+    const adapter = new MockAdapter([
+      ...Array.from({ length: 8 }, (_, i) => toolCallResponse(`c${i}`, 'probe', { q: 'same' })),
+      textResponse('done'),
+    ])
+    ctx.llm.registerAdapter(['mock'], adapter)
+    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await waitForIdle(ctx, agent)
+
+    const found = reminders(agent)
+    expect(found).toHaveLength(3)
+    expect(found[0]!.text).toContain('repeating the exact same tool call')
+    expect(found[1]!.text).toContain('consecutive_calls: 5')
+    expect(found[2]!.text).toContain('Repeated tool call blocked:')
+    expect(found[2]!.text).toContain('consecutive_calls: 8')
+    expect(found[2]!.source).toEqual(guardSource('probe', 8))
+    expect(lastToolIsError(agent)).toBe(true)
+    const results = toolResults(agent)
+    const blockedText = results[7]!.data.message.content[0].content
+      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+      .map(block => block.text)
+      .join('|')
+    expect(blockedText).toContain('Repeated tool call blocked:')
+  })
+
+  it('does not veto below stopAfter (7 identical calls still only remind)', async () => {
+    const ctx = await harness()
+    const adapter = new MockAdapter([
+      ...Array.from({ length: 7 }, (_, i) => toolCallResponse(`c${i}`, 'probe', { q: 'same' })),
+      textResponse('done'),
+    ])
+    ctx.llm.registerAdapter(['mock'], adapter)
+    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await waitForIdle(ctx, agent)
+
+    const found = reminders(agent)
+    expect(found).toHaveLength(2)
+    expect(found.some(r => r.text.includes('Repeated tool call blocked:'))).toBe(false)
+    expect(lastToolIsError(agent)).toBe(false)
+  })
+
+  it('keeps vetoing identical calls after stopAfter (9th is still blocked)', async () => {
+    const ctx = await harness()
+    const adapter = new MockAdapter([
+      ...Array.from({ length: 9 }, (_, i) => toolCallResponse(`c${i}`, 'probe', { q: 'same' })),
+      textResponse('done'),
+    ])
+    ctx.llm.registerAdapter(['mock'], adapter)
+    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await waitForIdle(ctx, agent)
+
+    const found = reminders(agent)
+    expect(found.filter(r => r.text.includes('Repeated tool call blocked:'))).toHaveLength(2) // 8 and 9
+    const results = toolResults(agent)
+    expect(results[7]!.data.message.content[0].isError).toBe(true)
+    expect(results[8]!.data.message.content[0].isError).toBe(true)
+  })
+
   it('keys the gentle text to thresholds[0], not the literal 3', async () => {
-    const ctx = await harness({ thresholds: [4, 2] }) // unsorted on purpose: normalized ascending
+    const ctx = await harness({ thresholds: [4, 2], stopAfter: 10 }) // unsorted on purpose: normalized ascending
     const adapter = new MockAdapter([
       ...Array.from({ length: 4 }, (_, i) => toolCallResponse(`c${i}`, 'probe', {})),
       textResponse('done'),
@@ -96,7 +168,7 @@ describe('threshold escalation', () => {
 
 describe('chain semantics', () => {
   it('caps the detailed reminder arguments at argumentsPreviewChars (detection still keys on the full string)', async () => {
-    const ctx = await harness({ thresholds: [2, 3], argumentsPreviewChars: 24 })
+    const ctx = await harness({ thresholds: [2, 3], stopAfter: 10, argumentsPreviewChars: 24 })
     const bigPayload = 'x'.repeat(400)
     const adapter = new MockAdapter([
       toolCallResponse('c1', 'probe', { body: bigPayload }),
@@ -276,7 +348,7 @@ describe('chain semantics', () => {
   })
 
   it('counts denied calls: hammering a denied tool still draws the reminder', async () => {
-    const ctx = await harness({ thresholds: [2] })
+    const ctx = await harness({ thresholds: [2], stopAfter: 10 })
     ctx.on('tools/pre-execute', async () => ({ kind: 'deny' as const, reason: 'sealed' }))
     const adapter = new MockAdapter([
       toolCallResponse('c1', 'probe', { q: 1 }),
@@ -310,7 +382,7 @@ describe('chain semantics', () => {
 
 describe('fold onto the downstream decision', () => {
   it('folds the reminder onto a downstream block and keeps its feedback', async () => {
-    const ctx = await harness({ thresholds: [2] })
+    const ctx = await harness({ thresholds: [2], stopAfter: 10 })
     ctx.on('tools/post-execute', async () => ({
       kind: 'block' as const,
       feedback: [{ type: 'text' as const, text: 'nope' }],
@@ -343,7 +415,7 @@ describe('fold onto the downstream decision', () => {
   })
 
   it('preserves a downstream canonical value replacement while folding', async () => {
-    const ctx = await harness({ thresholds: [2] })
+    const ctx = await harness({ thresholds: [2], stopAfter: 10 })
     ctx.on('tools/post-execute', async () => ({
       kind: 'accept' as const,
       value: [{ type: 'text' as const, text: 'replaced' }],
@@ -363,6 +435,51 @@ describe('fold onto the downstream decision', () => {
     expect(found[0]!.text).toContain('repeating the exact same tool call')
     const results = agent.session.snapshotEvents().filter((e): e is SessionEvent<'tool/result'> => e.type === 'tool/result')
     expect(results[1]!.data.message.content[0].content).toEqual([{ type: 'text', text: 'replaced' }])
+  })
+})
+
+describe('stopAfter veto', () => {
+  it('vetoes at a custom stopAfter below later reminder thresholds', async () => {
+    const ctx = await harness({ stopAfter: 4 })
+    const adapter = new MockAdapter([
+      ...Array.from({ length: 4 }, (_, i) => toolCallResponse(`c${i}`, 'probe', { q: 1 })),
+      textResponse('done'),
+    ])
+    ctx.llm.registerAdapter(['mock'], adapter)
+    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await waitForIdle(ctx, agent)
+
+    const found = reminders(agent)
+    expect(found).toHaveLength(2) // gentle at 3, stop at 4 (no detailed at 5)
+    expect(found[0]!.text).toContain('repeating the exact same tool call')
+    expect(found[1]!.text).toContain('Repeated tool call blocked:')
+    expect(found[1]!.text).toContain('consecutive_calls: 4')
+    expect(lastToolIsError(agent)).toBe(true)
+  })
+
+  it('replaces a downstream accept with block at stopAfter', async () => {
+    const ctx = await harness({ thresholds: [3], stopAfter: 2 })
+    ctx.on('tools/post-execute', async () => ({
+      kind: 'accept' as const,
+      value: [{ type: 'text' as const, text: 'replaced' }],
+    }))
+    const adapter = new MockAdapter([
+      toolCallResponse('c1', 'probe', { q: 1 }),
+      toolCallResponse('c2', 'probe', { q: 1 }),
+      textResponse('done'),
+    ])
+    ctx.llm.registerAdapter(['mock'], adapter)
+    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await waitForIdle(ctx, agent)
+
+    const found = reminders(agent)
+    expect(found).toHaveLength(1)
+    expect(found[0]!.text).toContain('Repeated tool call blocked:')
+    const results = toolResults(agent)
+    expect(results[1]!.data.message.content[0].isError).toBe(true)
+    expect(results[1]!.data.message.content[0].content).not.toEqual([{ type: 'text', text: 'replaced' }])
   })
 })
 
@@ -399,5 +516,12 @@ describe('config validation fails loud', () => {
     await expect(ctx.plugin(RepeatToolGuard, { argumentsPreviewChars: 0 })).rejects.toThrow(/argumentsPreviewChars/)
     const ctx2 = await spine()
     await expect(ctx2.plugin(RepeatToolGuard, { argumentsPreviewChars: 12.5 })).rejects.toThrow(/argumentsPreviewChars/)
+  })
+
+  it('rejects a stopAfter below 2 or a non-integer stopAfter', async () => {
+    const ctx = await spine()
+    await expect(ctx.plugin(RepeatToolGuard, { stopAfter: 1 })).rejects.toThrow(/stopAfter/)
+    const ctx2 = await spine()
+    await expect(ctx2.plugin(RepeatToolGuard, { stopAfter: 8.5 })).rejects.toThrow(/stopAfter/)
   })
 })

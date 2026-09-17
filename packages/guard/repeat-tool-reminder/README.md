@@ -1,5 +1,5 @@
 ---
-description: "Advisory loop-hygiene guard that nudges the model out of identical tool-call loops, for users and maintainers choosing, configuring, or debugging the plugin."
+description: "Loop-hygiene guard that reminds, then vetoes, identical tool-call loops, for users and maintainers choosing, configuring, or debugging the plugin."
 kind: "package-reference"
 ---
 
@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-This package helps a model escape loops in which it calls the same tool with identical arguments without making progress. At configured repeat counts, it asks the model to inspect the previous result and change approach or finish. The reminder is advisory: it never blocks or delays a legitimate repeated call. Repeats are tracked separately for each agent and cleared by a new user message. The `dsh` base bundle enables the package with reminders at 3, 5, and 8 repeats.
+A model can get stuck calling the same tool with the same arguments — re-running a failing command, re-reading an unchanged file — burning time and tokens without making progress. `dsh-repeat-tool-reminder` notices the pattern and tells the model to stop: at chosen repeat counts it delivers a reminder to analyze the last result and either try a different approach or finish. At `stopAfter` (default: the last threshold, 8 with the shipped defaults) it vetoes that identical call: the post-execute decision is `block`, plugin-sourced stop text is injected, and the agent loop remains free to conclude. Reminders below `stopAfter` stay advisory and do not delay a legitimate repeat. It tracks each agent separately, so one agent's loop never disturbs another's work, and a new user message clears the count. It ships enabled in the `dsh` base bundle with reminders at 3 and 5 repeats and a veto at 8.
 
 ## Table of Contents
 
@@ -25,37 +25,39 @@ This package helps a model escape loops in which it calls the same tool with ide
 <a id="use-this-package"></a>
 ## Use this package
 
-Mount this plugin when the model should catch itself looping on identical tool calls. There is nothing to learn or wire: the `dsh` base bundle already runs it, and the defaults work for most sessions — tune the thresholds and tool scope below when you want the nudge sooner, later, or on fewer tools.
+Mount this plugin when the model should catch itself looping on identical tool calls. There is nothing to learn or wire: the `dsh` base bundle already runs it, and the defaults work for most sessions — tune the thresholds, `stopAfter`, and tool scope below when you want the nudge sooner, later, or on fewer tools.
 
 ### When to choose it
 
-Choose it when the model works autonomously for long stretches and a stuck loop is the failure you want to break with advice rather than force. Avoid it when identical repeats are legitimate and must run undisturbed — the guard only reminds, and a reminder is a small extra message after the repeated call — and when near-identical variants must be caught, because only exact repeats (same tool, same arguments regardless of property order) are detected.
+Choose it when the model works autonomously for long stretches and a stuck loop is the failure you want to break first with advice, then by vetoing the identical call so the loop can still finish. Avoid it when identical repeats are legitimate and must run past eight consecutive copies — raise `stopAfter` or `exclude` those tools — and when near-identical variants must be caught, because only exact repeats (same tool, same arguments regardless of property order) are detected.
 
 ### Setting the thresholds and scope
 
-When you want to change when reminders fire or which tools they cover, mount the plugin with configuration:
+When you want to change when reminders fire, when the veto starts, or which tools they cover, mount the plugin with configuration:
 
 ```yaml
 - name: '@deepseek-ai/dsh-repeat-tool-reminder'
   config:
-    thresholds: [3, 5, 8]        # remind at 3, 5, and 8 consecutive repeats
+    thresholds: [3, 5, 8]        # remind at 3 and 5; 8 is the default stopAfter
+    stopAfter: 8                 # veto identical calls at this count and beyond
     include: []                  # track every tool; list patterns to track only some
     exclude: [todo_write]        # never track these tools
-    argumentsPreviewChars: 500   # cap on arguments shown in the detailed reminder
+    argumentsPreviewChars: 500   # cap on arguments shown in the detailed reminder and stop notice
 ```
 
 | Field | Default | Meaning |
 |---|---|---|
-| `thresholds` | `[3, 5, 8]` | Repeat counts that trigger a reminder |
+| `thresholds` | `[3, 5, 8]` | Repeat counts that trigger a reminder when they are below `stopAfter` |
+| `stopAfter` | last `thresholds` entry (`8`) | Repeat count at which this plugin vetoes the identical call; later identical calls are also vetoed |
 | `include` | `[]` | Only these tools are tracked; empty means every tool |
 | `exclude` | `[]` | These tools are never tracked; calls to them neither count nor reset |
-| `argumentsPreviewChars` | `500` | How many characters of the repeated arguments the detailed reminder shows |
+| `argumentsPreviewChars` | `500` | How many characters of the repeated arguments the detailed reminder and stop notice show |
 
-Invalid configuration fails at startup with a clear error — an empty `thresholds` list, a repeat count below 2, or a duplicate — never a silent change of behavior. The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-repeat-tool-reminder) documents every accepted value.
+Invalid configuration fails at startup with a clear error — an empty `thresholds` list, a repeat count or `stopAfter` below 2, a non-integer, or a duplicate threshold — never a silent change of behavior. The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-repeat-tool-reminder) documents every accepted value.
 
 ### What you get
 
-With the defaults, a model that repeats the same call with identical arguments receives a short reminder on the third repeat — to analyze the previous result before calling again — and detailed reminders on the fifth and eighth, naming the tool and the repeated arguments so it can decide whether to change approach, gather more evidence, or finish. A new user message clears the count, so a fresh instruction is never treated as a loop. Reminders appear in the conversation after the repeated call's result, attributed to the plugin, so the model reads them like any other message.
+With the defaults, a model that repeats the same call with identical arguments receives a short reminder on the third repeat — to analyze the previous result before calling again — a detailed reminder on the fifth, naming the tool and the repeated arguments, and a veto on the eighth: the call's post-execute decision is `block`, the tool result is the stop notice, and the same text is injected as plugin-sourced context. The agent loop is not halted, so the model can still choose a different action or finish. A new user message clears the count, so a fresh instruction is never treated as a loop. Reminder and stop notices appear in the conversation after the repeated call's result, attributed to the plugin.
 
 -----
 
@@ -71,10 +73,10 @@ This section explains how the guard detects repeats and delivers reminders, and 
 
 The guard is built on four commitments:
 
-- **Advisory, not veto.** The guard enriches post-execute decisions with model context; it never blocks or rewrites a call, so `PostToolDecision` blocking stays a later listener's job.
+- **Remind, then veto.** Below `stopAfter` the guard enriches post-execute decisions with model context and does not block or rewrite a call. At `stopAfter` and beyond it still calls `next()`, then returns `kind: 'block'` with plugin-sourced stop text: this vetoes the repeated tool result so the loop can conclude. It does not skip other listeners, rewrite prompts to evade HITL or command policy, or halt the agent loop.
 - **Count in post-execute.** Detection runs on `tools/post-execute`, which also fires for denied calls; counting there lets one listener cover every attempt with no cross-event state.
 - **Exact-match canonicalization.** Arguments reach the guard as the loop's `JSON.parse` output (or its raw-string fallback), so JSON's value domain is the whole input domain and a deep key-sort plus `JSON.stringify` is a complete, deterministic identity — no bigint, cycle, or `undefined` handling exists because no input path can produce them.
-- **Fail loud at load.** `thresholds` and `argumentsPreviewChars` validate in `apply` and throw, never falling back to defaults.
+- **Fail loud at load.** `thresholds`, `stopAfter`, and `argumentsPreviewChars` validate in `apply` and throw, never falling back to defaults. Omitted `stopAfter` resolves to the last `thresholds` entry.
 
 ### Detection: the repeat chain
 
@@ -88,7 +90,7 @@ Each agent's chain is keyed by `(tool name, canonical arguments)` — two calls 
 
 ### Reminder delivery
 
-Reminders ride the post-execute decision's `additionalContexts` (source `{kind: 'plugin', plugin: 'repeat-tool-reminder', form: 'notice', summary: '<tool> × <count>'}`), never a `content` replacement: the `tool/result` event stays the tool's own output for audit. The loop buffers the context and appends it as an injected `user/message` after the step's tool results, which the session renders as a plain synthetic user message — model-visible, source-attributed, and reconstructable from the session log with no new session event. The guard always delegates via `next()` and prepends its reminder to the downstream decision's context array, so both decision variants (a blocked call included) still get the nudge while every entry retains its own source and metadata.
+Reminders ride the post-execute decision's `additionalContexts` (source `{kind: 'plugin', plugin: 'repeat-tool-reminder', form: 'notice', summary: '<tool> × <count>'}`), never a `content` replacement on the reminder path: the `tool/result` event stays the tool's own output for audit. The loop buffers the context and appends it as an injected `user/message` after the step's tool results, which the session renders as a plain synthetic user message — model-visible, source-attributed, and reconstructable from the session log with no new session event. At `stopAfter` the same plugin source is used, but the decision is `block`: `feedback` becomes the error tool result and the stop notice is also prepended onto `additionalContexts`. The guard always delegates via `next()` first, so every downstream listener still runs; stop then replaces the returned decision. It does not bypass HITL, command policy, or other guards.
 
 ### Source map
 
@@ -159,6 +161,30 @@ Each reminder is retained history; `argumentsPreviewChars` bounds its data-depen
 
 Append-only; newly visible content follows the reusable request prefix and does not invalidate existing KV-cache entries.
 
+### Stop-tier block
+
+#### What the model sees
+
+At `stopAfter` and every later identical consecutive call, the agent receives the stop notice below as plugin-sourced context, and the tool result is that same text as an error. No tool schema or normal-call text is added.
+
+##### Stop notice
+
+```markdown
+Repeated tool call blocked:
+- tool: <toolName>
+- consecutive_calls: <count>
+- arguments: <canonicalArguments>
+This identical call was blocked because it made no progress. Do not retry this tool with these exact arguments. Inspect prior results and take a different action, or finish the task if enough evidence has been gathered.
+```
+
+#### Token effect
+
+Each stop notice is retained history; `argumentsPreviewChars` bounds its data-dependent argument text.
+
+#### KV Cache effect
+
+Append-only; newly visible content follows the reusable request prefix and does not invalidate existing KV-cache entries.
+
 ## Known Limitations and Deferred Work
 
 <a id="known-limitations-and-deferred-work"></a>
@@ -168,10 +194,10 @@ These limits define when the guard is a poor fit. They are current package const
 
 - **Exact-match detection only** — canonicalization is a deep key-sort, so near-identical variants (a tweaked path, extra whitespace inside a value) evade the chain; fuzzy matching is rejected pending evidence of need.
 - **Compaction does not reset chains** — a chain spanning a compaction checkpoint keeps counting.
-- **Advisory only** — escalating to a blocking form at a high threshold is not implemented, though `PostToolDecision` already supports blocking.
+- **Post-execute veto cannot undo side effects** — `stopAfter` blocks the tool *result* after the call has already run; a later identical call is also executed then blocked. `exclude` polling tools rather than expecting a pre-execute deny.
 - **No subagent chain-sharing** — chains stay isolated per agent; a parent and its subagent repeating the same call never combine.
-- **Legitimate idempotent polling still draws nudges** past the thresholds — the pressure valves are the `thresholds`/`exclude` config.
-- **Past the highest threshold a chain goes silent** — reminders fire only at exact configured counts, never beyond them.
+- **Legitimate idempotent polling still draws nudges and, at `stopAfter`, a veto** — the pressure valves are the `thresholds` / `stopAfter` / `exclude` config.
+- **Reminders fire only at exact configured counts below `stopAfter`** — a threshold equal to or above `stopAfter` never delivers a reminder; the stop notice is used instead.
 
 <a id="dev-note"></a>
 ### Dev Note
@@ -181,6 +207,6 @@ These limits define when the guard is a poor fit. They are current package const
 
 This Dev Note is working context for maintainers: open questions and directions that are not decided. It is explicitly non-authoritative — shipped behavior, limits, and accepted rationale live in the sections above, the package code, and the linked Agent Notes.
 
-The [repeat-tool-guard feature note](../../../.agents/notes/archived/feature/2026-07-08-repeat-tool-guard.md) records the original design and alternatives under the former package name; the [naming ledger](../../../.agents/notes/archived/architecture/2026-08-11-repository-naming-contract-and-rename-ledger.md) records the rename to `repeat-tool-reminder` and its reason.
+The [repeat-tool-guard feature note](../../../.agents/notes/archived/feature/2026-07-08-repeat-tool-guard.md) records the original design and alternatives under the former package name; the [naming ledger](../../../.agents/notes/archived/architecture/2026-08-11-repository-naming-contract-and-rename-ledger.md) records the rename to `repeat-tool-reminder` and its reason. The [repeat-tool stop-gate note](../../../.agents/notes/implemented/architecture/2026-09-05-repeat-tool-stop-gate.md) records why the shipped plugin vetoes at `stopAfter` rather than remaining advisory-only.
 
 </details>
