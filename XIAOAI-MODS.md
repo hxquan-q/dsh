@@ -30,3 +30,4 @@
 | 7 | `tsdown` workspace 纳入 xiaoai 包 | `tsdown.config.ts` | 否则只产出 `lib/types/*.d.ts`，ACP 启动 `ERR_MODULE_NOT_FOUND`（TASK-656 现场） | 否 |
 | 8 | Write 参数流式进 ACP `tool_call_update` in_progress | 新文件 `packages/acp/acp/src/write-draft-stream.ts`；`updates.ts` `toolCallProgressUpdate`；`session.ts` `onAssistantStream` 截获 `agent/assistant-stream` 的 `tool-call-delta` | TASK-828：md Write 边生成边上报 content 后缀；Edit / 非 md 不发 | 否（平台 Canvas 私有） |
 | 9 | `repeat-tool-reminder` stop 档（`stopAfter` veto） | `packages/guard/repeat-tool-reminder/src/index.ts` 等 | 死循环防抖升级：低于 `stopAfter` 提醒，达到后 `block` + 注入停止说明（TASK-695） | 否（上游仍是 advisory-only） |
+| 10 | ACP 文本与思考实时流式增量 | `packages/acp/acp/src/session.ts` `onAssistantStream`（text-delta/reasoning-delta 投影）、`updates.ts` `assistantUpdates`（按已流预算裁剪终块） | TASK-882：`agent_message_chunk`/`agent_thought_chunk` 逐 token 下发 + 终块去重；恢复打字机 & 思考边想边流 | 否（平台真流式私有语义，含 partial 未收口行为变更） |

@@ -93,6 +93,33 @@ describe('ACP prompt lifecycle', () => {
     expect(new Set(harness.updates.map(update => 'messageId' in update ? update.messageId : undefined)).size).toBe(1)
   })
 
+  it('projects text and reasoning deltas incrementally without replaying the full body (TASK-882)', async () => {
+    harness = await makeBridgeHarness({ script: [[
+      { type: 'block-start', index: 0, blockType: 'reasoning' },
+      { type: 'reasoning-delta', index: 0, text: '想' },
+      { type: 'reasoning-delta', index: 0, text: '一步' },
+      { type: 'block-end', index: 0, block: { type: 'reasoning', text: '想一步' } },
+      { type: 'block-start', index: 1, blockType: 'text' },
+      ...Array.from('打字机', char => ({ type: 'text-delta' as const, index: 1, text: char })),
+      { type: 'block-end', index: 1, block: { type: 'text', text: '打字机' } },
+      { type: 'usage', usage: { inputTokens: 4, outputTokens: 4 } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]] })
+    const sessionId = await newSession(harness)
+    await harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+    await vi.waitFor(() => { expect(harness!.updates.at(-1)?.sessionUpdate).toBe('usage_update') })
+
+    const text = harness.updates.flatMap(update => update.sessionUpdate === 'agent_message_chunk'
+      && update.content.type === 'text' ? [update.content.text] : []).join('')
+    const thought = harness.updates.flatMap(update => update.sessionUpdate === 'agent_thought_chunk'
+      && update.content.type === 'text' ? [update.content.text] : []).join('')
+    // 真流式：正文与思考按小粒度增量送达，且终块不重复叠加全文。
+    expect(text).toBe('打字机')
+    expect(thought).toBe('想一步')
+    expect(harness.updates.filter(update => update.sessionUpdate === 'agent_message_chunk').length)
+      .toBeGreaterThanOrEqual(3)
+  })
+
   it('does not settle a prompt before ordered output delivery drains', async () => {
     const script: StreamChunk[][] = []
     harness = await makeBridgeHarness({ script })
@@ -139,12 +166,14 @@ describe('ACP prompt lifecycle', () => {
     expect(harness.updates).toEqual([])
   })
 
-  it('rejects a failed turn and never publishes its partial chunks', async () => {
+  it('rejects a failed turn but streams its live-partial chunks (TASK-882)', async () => {
     harness = await makeBridgeHarness({ script: [errorResponse('provider boom')] })
     const sessionId = await newSession(harness)
     await expect(harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] }))
       .rejects.toThrow(/turn failed: provider boom/)
-    expect(messageText(harness)).toBe('')
+    // 真流式投影：文本/思考增量一经产生即下发；回合最终失败时应答该失败，已流出的
+    // partial 保留（客户端按自身 error 语义收口/抹除），而不是回吞。
+    expect(messageText(harness)).toBe('partial')
   })
 
   it('rejects an ordinary plugin failure through the same prompt boundary', async () => {
@@ -502,7 +531,7 @@ describe('ACP prompt lifecycle', () => {
     await vi.waitFor(() => { expect(messageText(harness!)).toBe('partialnext') })
   })
 
-  it('a retry turn adopts the prompt instead of rejecting at the failed turn end', async () => {
+  it('a retry turn adopts the prompt and appends only the retry stream (TASK-882)', async () => {
     harness = await makeBridgeHarness({ script: [errorResponse('transient boom'), textResponse('recovered')] })
     // A recovery policy: schedule one retry for the failed request.
     let retried = false
@@ -515,7 +544,8 @@ describe('ACP prompt lifecycle', () => {
     const sessionId = await newSession(harness)
     const result = await harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
     expect(result.stopReason).toBe('end_turn')
-    await vi.waitFor(() => { expect(messageText(harness!)).toBe('recovered') })
+    // 首次失败 attempt 的 partial 真流式已下发；重试替换终稿，不得再叠加一次全文。
+    await vi.waitFor(() => { expect(messageText(harness!)).toBe('partialrecovered') })
   })
 
   it('a failed turn with no retry still rejects', async () => {

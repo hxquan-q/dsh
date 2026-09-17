@@ -106,6 +106,10 @@ export class AcpSession {
   private readonly pendingSelections = new Map<string, ModelSelection>()
   /** Per-call Write argument streamers (TASK-828). Cleared on tool/call or tool/result. */
   private readonly writeDrafts = new Map<string, WriteDraftStreamer>()
+  /** Live text/reasoning character budgets already projected, keyed by `${turn}:${step}` (TASK-882). */
+  private readonly streamedBudget = new Map<string, { text: number; reasoning: number }>()
+  /** Attempt context for the currently-streaming `agent/assistant-stream` (TASK-882). */
+  private liveAttempt: { key: string; attemptId: string } | undefined
 
   private constructor(
     private readonly ctx: Context,
@@ -350,8 +354,10 @@ export class AcpSession {
       if (event.type === 'assistant/message') {
         const inflight = this.inflight?.turn === event.data.turn ? this.inflight : undefined
         const previous = this.outputTail
+        const streamed = this.streamedBudget.get(`${event.data.turn}:${event.data.step}`)
+        this.streamedBudget.delete(`${event.data.turn}:${event.data.step}`)
         const delivery = previous.then(async () => {
-          for (const update of await assistantUpdates(this.ctx, session, event)) {
+          for (const update of await assistantUpdates(this.ctx, session, event, streamed)) {
             await this.notify({ sessionId: this.agent.session.id, update })
           }
         })
@@ -397,11 +403,43 @@ export class AcpSession {
   /**
    * Project one transient assistant-stream frame (TASK-828 / xiaoai).
    * `agent/assistant-stream` replaced the removed `assistant/chunk` session
-   * event; only `tool-call-delta` frames feed the per-call Write draft streamer.
+   * event; `text`/`reasoning` deltas project live output chunks whose prefixes
+   * the committed message trims (TASK-882), and `tool-call-delta` frames feed
+   * the per-call Write draft streamer (TASK-828).
    * @param frame - agent-scoped assistant-stream frame.
    */
   onAssistantStream(frame: AssistantStreamFrame): void {
-    if (frame.type !== 'chunk' || frame.chunk.type !== 'tool-call-delta') return
+    const isStreamBegin = frame.type === 'start'
+    if (isStreamBegin) {
+      this.liveAttempt = { key: `${frame.turn}:${frame.step}`, attemptId: frame.attemptId }
+      this.streamedBudget.set(this.liveAttempt.key, { text: 0, reasoning: 0 })
+      return
+    }
+    if (frame.type === 'end') {
+      const ended = this.liveAttempt
+      this.liveAttempt = undefined
+      if (ended !== undefined) this.streamedBudget.delete(ended.key)
+      return
+    }
+    const live = this.liveAttempt
+    if (live === undefined || live.attemptId !== frame.attemptId) return
+    if (frame.chunk.type !== 'tool-call-delta') {
+      const budget = this.streamedBudget.get(live.key)
+      if (budget !== undefined && frame.chunk.type === 'text-delta' && frame.chunk.text.length > 0) {
+        budget.text += frame.chunk.text.length
+        this.enqueueChunk({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: frame.chunk.text },
+        })
+      } else if (budget !== undefined && frame.chunk.type === 'reasoning-delta' && frame.chunk.text.length > 0) {
+        budget.reasoning += frame.chunk.text.length
+        this.enqueueChunk({
+          sessionUpdate: 'agent_thought_chunk',
+          content: { type: 'text', text: frame.chunk.text },
+        })
+      }
+      return
+    }
     const chunk = frame.chunk
     const callId = chunk.id
     let streamer = this.writeDrafts.get(callId)
@@ -420,6 +458,22 @@ export class AcpSession {
       /* v8 ignore start -- the bridge notifier contains transport rejection. */
       .catch((error: unknown) => {
         this.ctx.logger.warn(`acp: write-draft increment delivery failed: ${errorChain(error)}`)
+      })
+      /* v8 ignore stop */
+  }
+
+  /**
+   * Queue one live text/reasoning chunk update in stream order (TASK-882).
+   * Transport failure is contained so a dropped chunk never stalls the live stream.
+   * @param update - transient text or reasoning projection.
+   */
+  private enqueueChunk(update: { sessionUpdate: 'agent_message_chunk' | 'agent_thought_chunk'; content: { type: 'text'; text: string } }): void {
+    const previous = this.outputTail
+    this.outputTail = previous
+      .then(() => this.notify({ sessionId: this.agent.session.id, update }))
+      /* v8 ignore start -- the bridge notifier contains transport failure. */
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(`acp: live chunk delivery failed: ${errorChain(error)}`)
       })
       /* v8 ignore stop */
   }

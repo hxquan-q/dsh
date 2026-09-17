@@ -12,37 +12,65 @@ import type { WriteDraftIncrement } from './write-draft-stream.ts'
  * @param ctx - bridge context carrying attachment and token-meter services.
  * @param session - durable session used for context pressure.
  * @param event - committed assistant message event.
+ * @param streamed - text/reasoning character counts already projected live from
+ *   `agent/assistant-stream` deltas (TASK-882). Their prefix is trimmed off the
+ *   committed blocks so an accumulating ACP client does not append them again.
  * @returns ordered standard thought, message, and optional usage updates.
  */
 export async function assistantUpdates(
   ctx: Context,
   session: Session,
   event: SessionEvent<'assistant/message'>,
+  streamed: { text: number; reasoning: number } = { text: 0, reasoning: 0 },
 ): Promise<SessionUpdate[]> {
   const updates: SessionUpdate[] = []
+  let textTail = streamed.text
+  let reasoningTail = streamed.reasoning
   for (const block of event.data.message.content) {
     if (block.type === 'reasoning') {
-      if (block.text.length > 0) {
+      const tail = slicePast(block.text, reasoningTail)
+      reasoningTail = countLeft(reasoningTail, block.text.length)
+      if (tail.length > 0) {
         updates.push({
           sessionUpdate: 'agent_thought_chunk',
           messageId: event.data.message.id,
-          content: { type: 'text', text: block.text },
+          content: { type: 'text', text: tail },
         })
       }
       continue
     }
     const content = await assistantBlockToAcp(ctx, block)
-    if (content !== undefined) {
+    if (content === undefined) continue
+    if (content.type === 'text') {
+      const projected = slicePast(content.text, textTail)
+      textTail = countLeft(textTail, content.text.length)
+      if (projected.length === 0) continue
       updates.push({
         sessionUpdate: 'agent_message_chunk',
         messageId: event.data.message.id,
-        content,
+        content: { type: 'text', text: projected },
       })
+      continue
     }
+    updates.push({
+      sessionUpdate: 'agent_message_chunk',
+      messageId: event.data.message.id,
+      content,
+    })
   }
   const usage = usageUpdate(ctx, session, event)
   if (usage !== undefined) updates.push(usage)
   return updates
+}
+
+/** Return `text` minus its first `prefix` characters, clamped to length 0. */
+function slicePast(text: string, prefix: number): string {
+  return prefix <= 0 ? text : text.slice(Math.min(prefix, text.length))
+}
+
+/** The part of a `prefix` budget not yet consumed by a `length` block. */
+function countLeft(prefix: number, length: number): number {
+  return Math.max(0, prefix - length)
 }
 
 /**

@@ -39,20 +39,23 @@ describe('ACP automation output boundary', () => {
     await harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
 
     await vi.waitFor(() => { expect(harness!.updates.at(-1)?.sessionUpdate).toBe('usage_update') })
-    expect(harness.updates.map(update => update.sessionUpdate)).toEqual([
-      'agent_thought_chunk',
-      'usage_update',
-      'tool_call',
-      'tool_call_update',
-      'agent_message_chunk',
-      'usage_update',
-    ])
-    expect(harness.updates[0]).toMatchObject({
-      sessionUpdate: 'agent_thought_chunk',
-      content: { type: 'text', text: 'inspect first' },
+    const text = harness.updates.flatMap(update => update.sessionUpdate === 'agent_message_chunk'
+      && update.content.type === 'text' ? [update.content.text] : []).join('')
+    const thought = harness.updates.flatMap(update => update.sessionUpdate === 'agent_thought_chunk'
+      && update.content.type === 'text' ? [update.content.text] : []).join('')
+    const kindOrder = harness.updates.map(update => update.sessionUpdate)
+    expect(kindOrder.filter(kind => kind === 'tool_call').length).toBe(1)
+    expect(kindOrder.filter(kind => kind === 'tool_call_update').length).toBe(1)
+    await vi.waitFor(() => {
+      expect(kindOrder.indexOf('agent_thought_chunk')).toBeGreaterThan(-1)
+      expect(kindOrder.indexOf('tool_call')).toBeGreaterThan(kindOrder.indexOf('agent_thought_chunk'))
+      expect(kindOrder.indexOf('tool_call_update')).toBeGreaterThan(kindOrder.indexOf('tool_call'))
+      expect(kindOrder.lastIndexOf('agent_message_chunk')).toBeGreaterThan(kindOrder.indexOf('tool_call_update'))
     })
-    expect('messageId' in harness.updates[0]!).toBe(true)
-    expect(harness.updates[2]).toMatchObject({
+    expect(thought).toBe('inspect first')
+    expect(text).toBe('done')
+    const toolCall = harness.updates.find(update => update.sessionUpdate === 'tool_call')
+    expect(toolCall).toMatchObject({
       sessionUpdate: 'tool_call',
       toolCallId: 'call-1',
       title: 'echo',
@@ -60,23 +63,16 @@ describe('ACP automation output boundary', () => {
       status: 'in_progress',
       rawInput: {},
     })
-    expect(harness.updates[3]).toMatchObject({
+    const toolUpdate = harness.updates.find(update => update.sessionUpdate === 'tool_call_update')
+    expect(toolUpdate).toMatchObject({
       sessionUpdate: 'tool_call_update',
       toolCallId: 'call-1',
       status: 'completed',
       content: [{ type: 'content', content: { type: 'text', text: 'tool result' } }],
     })
-    expect(harness.updates[4]).toMatchObject({
-      sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: 'done' },
-    })
-    expect('messageId' in harness.updates[4]!).toBe(true)
-    expect(harness.updates[5]).toMatchObject({
-      sessionUpdate: 'usage_update',
-      size: 1_024,
-    })
-    if (harness.updates[5]?.sessionUpdate !== 'usage_update') throw new Error('expected usage update')
-    expect(typeof harness.updates[5].used).toBe('number')
+    const usage = harness.updates.filter(update => update.sessionUpdate === 'usage_update')
+    expect(usage.length).toBeGreaterThan(0)
+    expect(usage.at(-1)).toMatchObject({ size: 1_024 })
   })
 
   it('ignores events from agents the bridge does not own', async () => {
@@ -102,11 +98,10 @@ describe('ACP automation output boundary', () => {
     await agent.whenIdle()
     await vi.waitFor(() => { expect(harness!.updates.at(-1)?.sessionUpdate).toBe('usage_update') })
 
-    expect(harness.updates[0]).toMatchObject({
-      sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: 'external' },
-    })
-    expect('messageId' in harness.updates[0]!).toBe(true)
+    // 真流式（TASK-882）：增量折叠后等于完整答案。
+    const text = harness.updates.flatMap(update => update.sessionUpdate === 'agent_message_chunk'
+      && update.content.type === 'text' ? [update.content.text] : []).join('')
+    expect(text).toBe('external')
   })
 
   it('contains output conversion failure outside an ACP prompt', async () => {
