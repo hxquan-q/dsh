@@ -15,7 +15,7 @@
 ## 0.1.6-alpha.1 replay 冲突处置（本锚点新增）
 
 - **patch #4 `mcp-client/transport.ts`**：上游 `489c3ac715` 整体换成官方 SDK（`@modelcontextprotocol/client`）并删去 `as Transport` 转型。`resolveHeaderEnv` 主体照旧，仅贴到新 import 形态上；`createTransport` 每代重读 `process.env`（`buildChildEnv` 只影响 stdio 子进程 env，不影响 streamable-http header 插值）。
-- **patch #8 `acp/session.ts` 接线点重做**：上游删除 `assistant/chunk` session 事件（raw chunk 并入 `assistant/message.stream`），新增 `agent/assistant-stream` 派发事件。`WriteDraftStreamer` 主体不变；`session.ts` 从 `onSessionEvent` 截获 `assistant/chunk` 改为新增 `onAssistantStream(frame)` 截获 `agent/assistant-stream` 的 `chunk` 帧（`frame.chunk.type === 'tool-call-delta'`）；`updates.ts` `toolCallProgressUpdate` 不变；`index.ts` 新增 `ctx.on('agent/assistant-stream', ...)` 派发。TASK-882 的文本/思考增量投影仍在上游未做，不受此改动影响。
+- **patch #8 `acp/session.ts` 接线点重做**：上游删除 `assistant/chunk` session 事件（raw chunk 并入 `assistant/message.stream`），新增 `agent/assistant-stream` 派发事件。`WriteDraftStreamer` 主体不变；`session.ts` 从 `onSessionEvent` 截获 `assistant/chunk` 改为新增 `onAssistantStream(frame)` 截获 `agent/assistant-stream` 的 `chunk` 帧（`frame.chunk.type === 'tool-call-delta'`）；`updates.ts` `toolCallProgressUpdate` 不变；`index.ts` 新增 `ctx.on('agent/assistant-stream', ...)` 派发。TASK-882 文本/思考增量投影见本表 #10，挂在同一 `onAssistantStream` 入口。
 - **patch #9（本锚点补登记）`repeat-tool-reminder` stop 档**：上一锚点该改动已存在但漏登记（ADR-0033 已记载）。上游 `src/index.ts` 0.1.2→0.1.6 零变化，`stopAfter` veto 逻辑照旧；tests/README 因上游 `ctx.agentLoop.create` 改 async 而适配。
 
 ## 0.1.6-alpha.1 部署面修复（主仓 docker/，2026-09-17 实测）
@@ -38,3 +38,4 @@
 | 7 | `tsdown` workspace 纳入 xiaoai 包 | `tsdown.config.ts` | 否则只产出 `lib/types/*.d.ts`，ACP 启动 `ERR_MODULE_NOT_FOUND`（TASK-656 现场） | 否 |
 | 8 | Write 参数流式进 ACP `tool_call_update` in_progress | 新文件 `packages/acp/acp/src/write-draft-stream.ts`；`updates.ts` `toolCallProgressUpdate`；`session.ts` `onAssistantStream` 截获 `agent/assistant-stream` 的 `tool-call-delta` | TASK-828：md Write 边生成边上报 content 后缀；Edit / 非 md 不发 | 否（平台 Canvas 私有） |
 | 9 | `repeat-tool-reminder` stop 档（`stopAfter` veto） | `packages/guard/repeat-tool-reminder/src/index.ts` 等 | 死循环防抖升级：低于 `stopAfter` 提醒，达到后 `block` + 注入停止说明（TASK-695） | 否（上游仍是 advisory-only） |
+| 10 | ACP 文本/思考增量投影 | `packages/acp/acp/src/session.ts` `onAssistantStream`；`updates.ts` `assistantChunkUpdate` / `unstreamedSuffix` | TASK-882：live `text-delta`/`reasoning-delta` → `agent_message_chunk`/`agent_thought_chunk`；终块跳过已流前缀，避免拼接型客户端重复 | 否（xiaoai 流式观感） |

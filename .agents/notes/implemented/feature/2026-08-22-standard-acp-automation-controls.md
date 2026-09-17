@@ -48,9 +48,9 @@ ACP clients are trusted controllers: a stdio declaration authorizes process exec
 
 ## Semantic update projection
 
-Only committed durable facts reach `session/update`. Assistant text/images become `agent_message_chunk`; reasoning becomes `agent_thought_chunk`; tool calls/results become generic `tool_call` and `tool_call_update`; known measured context pressure and capacity become `usage_update`; adapter topology changes become `config_option_update`. Durable message ids and tool-call ids preserve correlation. The canonical DSH tool name is the standard tool-call title.
+Committed tool, image, usage, and configuration facts reach `session/update` as before. Live `text-delta` and `reasoning-delta` frames also project as `agent_message_chunk` and `agent_thought_chunk`; the later committed message emits only the unstreamed suffix so concatenative clients do not duplicate ([ACP live text and reasoning chunk projection](./2026-09-17-acp-live-text-and-reasoning-chunks.md)). Tool calls/results become generic `tool_call` and `tool_call_update`; known measured context pressure and capacity become `usage_update`; adapter topology changes become `config_option_update`. Durable message ids and tool-call ids preserve correlation on committed updates. The canonical DSH tool name is the standard tool-call title.
 
-The per-session chain serializes all updates and drains before prompt completion. A tool-call notification drains before a permission request refers to it. Raw model deltas, retry attempts, cards, terminal state, diffs, locations, plans, titles, todos, and unsupported content stay off the wire.
+The per-session chain serializes all updates and drains before prompt completion. A tool-call notification drains before a permission request refers to it. Other raw model deltas, retry attempts, cards, terminal state, diffs, locations, plans, titles, todos, and unsupported content stay off the wire.
 
 `session/cancel` and `$/cancel_request` enter the same prompt-owned cancellation path. Correlated endings map only to standard stop reasons and JSON-RPC errors; a model output limit reports `max_tokens`. ACP returns no additional DSH result structure.
 

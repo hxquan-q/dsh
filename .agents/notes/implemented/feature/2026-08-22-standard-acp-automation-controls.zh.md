@@ -48,9 +48,9 @@ ACP 客户端是受信任的控制器：stdio 声明授权执行进程，HTTP �
 
 ## 语义更新投影
 
-只有已提交的持久事实会进入 `session/update`。Assistant 文本／图片变成 `agent_message_chunk`；reasoning 变成 `agent_thought_chunk`；工具调用／结果变成通用 `tool_call` 和 `tool_call_update`；已知的测量上下文压力与容量变成 `usage_update`；adapter 拓扑变化变成 `config_option_update`。持久消息 id 和工具调用 id 保留关联。规范 DSH 工具名作为标准工具调用 title。
+只有已提交的工具、图片、用量与配置事实进入 `session/update`。现场 `text-delta` / `reasoning-delta` 也会投影为 `agent_message_chunk` / `agent_thought_chunk`；随后的已提交消息只发尚未流过的后缀，避免拼接型客户端把答案写两遍（[ACP 现场文本与推理增量投影](./2026-09-17-acp-live-text-and-reasoning-chunks.zh.md)）。工具调用／结果变成通用 `tool_call` 和 `tool_call_update`；已知的测量上下文压力与容量变成 `usage_update`；adapter 拓扑变化变成 `config_option_update`。已提交更新上的持久消息 id 和工具调用 id 保留关联。规范 DSH 工具名作为标准工具调用 title。
 
-Per-session 链会串行处理所有更新，并在提示词完成前 drain。引用工具调用的权限请求只会在该工具调用通知 drain 后发送。原始模型 delta、重试尝试、卡片、终端状态、diff、位置、计划、标题、todo 和不受支持内容不会进入 wire。
+Per-session 链会串行处理所有更新，并在提示词完成前 drain。引用工具调用的权限请求只会在该工具调用通知 drain 后发送。其它原始模型 delta、重试尝试、卡片、终端状态、diff、位置、计划、标题、todo 和不受支持内容不会进入 wire。
 
 `session/cancel` 和 `$/cancel_request` 进入同一个提示词自有取消路径。关联结尾只映射到标准 stop reason 和 JSON-RPC error；模型输出达到上限时报告 `max_tokens`。ACP 不返回额外 DSH 结果结构。
 

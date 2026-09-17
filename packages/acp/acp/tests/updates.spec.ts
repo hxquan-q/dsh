@@ -2,7 +2,14 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { ToolCallId, MessageId } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
-import { assistantUpdates, toolCallProgressUpdate, toolCallUpdate, toolResultUpdate } from '../src/updates.ts'
+import {
+  assistantChunkUpdate,
+  assistantUpdates,
+  toolCallProgressUpdate,
+  toolCallUpdate,
+  toolResultUpdate,
+  unstreamedSuffix,
+} from '../src/updates.ts'
 
 /** Minimal committed assistant event for pure update projection tests. */
 function assistantEvent(
@@ -102,5 +109,56 @@ describe('standard ACP update projection', () => {
       rawInput: { file_path: 'report.md', seq: 2 },
       content: [{ type: 'content', content: { type: 'text', text: '## 节' } }],
     })
+  })
+
+  it('subtracts live prefixes so concatenative clients do not reprint committed text', () => {
+    expect(unstreamedSuffix('Hello', 'Hello')).toEqual({ text: '', rest: '' })
+    expect(unstreamedSuffix('Hello', 'Hel')).toEqual({ text: 'lo', rest: '' })
+    expect(unstreamedSuffix('Hello', 'Hello extra')).toEqual({ text: '', rest: ' extra' })
+    expect(unstreamedSuffix('Hello', 'xyz')).toEqual({ text: '', rest: '' })
+    expect(unstreamedSuffix('Hello', '')).toEqual({ text: 'Hello', rest: '' })
+  })
+
+  it('projects nonempty text and reasoning deltas and ignores other chunks', () => {
+    expect(assistantChunkUpdate({ type: 'text-delta', index: 0, text: 'ab' })).toEqual({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'ab' },
+    })
+    expect(assistantChunkUpdate({ type: 'reasoning-delta', index: 0, text: 'why' })).toEqual({
+      sessionUpdate: 'agent_thought_chunk',
+      content: { type: 'text', text: 'why' },
+    })
+    expect(assistantChunkUpdate({ type: 'text-delta', index: 0, text: '' })).toBeUndefined()
+    expect(assistantChunkUpdate({
+      type: 'tool-call-delta',
+      index: 0,
+      id: ToolCallId('c'),
+      argumentsDelta: '{',
+    })).toBeUndefined()
+  })
+
+  it('omits committed text and reasoning that live deltas already projected', async () => {
+    const ctx = { get: () => undefined } as unknown as Context
+    const session = { requestContext: () => undefined } as unknown as Session
+    const event = assistantEvent([
+      { type: 'reasoning', text: 'thinking' },
+      { type: 'text', text: 'Hello' },
+    ])
+
+    await expect(assistantUpdates(ctx, session, event, { text: 'Hello', reasoning: 'thinking' }))
+      .resolves.toEqual([])
+    await expect(assistantUpdates(ctx, session, event, { text: 'Hel', reasoning: 'think' }))
+      .resolves.toEqual([
+        {
+          sessionUpdate: 'agent_thought_chunk',
+          messageId: 'message-1',
+          content: { type: 'text', text: 'ing' },
+        },
+        {
+          sessionUpdate: 'agent_message_chunk',
+          messageId: 'message-1',
+          content: { type: 'text', text: 'lo' },
+        },
+      ])
   })
 })

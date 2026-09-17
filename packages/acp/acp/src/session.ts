@@ -17,7 +17,13 @@ import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { mountAcpMcpServers } from './mcp.ts'
 import { AcpModelControl } from './model-control.ts'
-import { assistantUpdates, toolCallProgressUpdate, toolCallUpdate, toolResultUpdate } from './updates.ts'
+import {
+  assistantChunkUpdate,
+  assistantUpdates,
+  toolCallProgressUpdate,
+  toolCallUpdate,
+  toolResultUpdate,
+} from './updates.ts'
 import { WriteDraftStreamer } from './write-draft-stream.ts'
 
 /** The continuable-subagent teardown used without depending on the subagent package. */
@@ -106,6 +112,10 @@ export class AcpSession {
   private readonly pendingSelections = new Map<string, ModelSelection>()
   /** Per-call Write argument streamers (TASK-828). Cleared on tool/call or tool/result. */
   private readonly writeDrafts = new Map<string, WriteDraftStreamer>()
+  /** Live text already sent as `agent_message_chunk` in the current attempt. */
+  private streamedText = ''
+  /** Live reasoning already sent as `agent_thought_chunk` in the current attempt. */
+  private streamedReasoning = ''
 
   private constructor(
     private readonly ctx: Context,
@@ -349,9 +359,12 @@ export class AcpSession {
     try {
       if (event.type === 'assistant/message') {
         const inflight = this.inflight?.turn === event.data.turn ? this.inflight : undefined
+        const streamed = { text: this.streamedText, reasoning: this.streamedReasoning }
+        this.streamedText = ''
+        this.streamedReasoning = ''
         const previous = this.outputTail
         const delivery = previous.then(async () => {
-          for (const update of await assistantUpdates(this.ctx, session, event)) {
+          for (const update of await assistantUpdates(this.ctx, session, event, streamed)) {
             await this.notify({ sessionId: this.agent.session.id, update })
           }
         })
@@ -395,31 +408,46 @@ export class AcpSession {
   }
 
   /**
-   * Project one transient assistant-stream frame (TASK-828 / xiaoai).
-   * `agent/assistant-stream` replaced the removed `assistant/chunk` session
-   * event; only `tool-call-delta` frames feed the per-call Write draft streamer.
+   * Project one transient assistant-stream frame (TASK-828 Write drafts and
+   * TASK-882 text/reasoning typewriter). `agent/assistant-stream` replaced the
+   * removed `assistant/chunk` session event.
    * @param frame - agent-scoped assistant-stream frame.
    */
   onAssistantStream(frame: AssistantStreamFrame): void {
-    if (frame.type !== 'chunk' || frame.chunk.type !== 'tool-call-delta') return
+    if (frame.type !== 'chunk') return
     const chunk = frame.chunk
-    const callId = chunk.id
-    let streamer = this.writeDrafts.get(callId)
-    if (streamer === undefined) {
-      streamer = new WriteDraftStreamer()
-      this.writeDrafts.set(callId, streamer)
+    if (chunk.type === 'tool-call-delta') {
+      const callId = chunk.id
+      let streamer = this.writeDrafts.get(callId)
+      if (streamer === undefined) {
+        streamer = new WriteDraftStreamer()
+        this.writeDrafts.set(callId, streamer)
+      }
+      const increment = streamer.push(chunk.name, chunk.argumentsDelta)
+      if (increment === undefined) return
+      const previous = this.outputTail
+      this.outputTail = previous
+        .then(() => this.notify({
+          sessionId: this.agent.session.id,
+          update: toolCallProgressUpdate(callId, increment),
+        }))
+        /* v8 ignore start -- the bridge notifier contains transport rejection. */
+        .catch((error: unknown) => {
+          this.ctx.logger.warn(`acp: write-draft increment delivery failed: ${errorChain(error)}`)
+        })
+        /* v8 ignore stop */
+      return
     }
-    const increment = streamer.push(chunk.name, chunk.argumentsDelta)
-    if (increment === undefined) return
+    const update = assistantChunkUpdate(chunk)
+    if (update === undefined) return
+    if (chunk.type === 'text-delta') this.streamedText += chunk.text
+    else if (chunk.type === 'reasoning-delta') this.streamedReasoning += chunk.text
     const previous = this.outputTail
     this.outputTail = previous
-      .then(() => this.notify({
-        sessionId: this.agent.session.id,
-        update: toolCallProgressUpdate(callId, increment),
-      }))
+      .then(() => this.notify({ sessionId: this.agent.session.id, update }))
       /* v8 ignore start -- the bridge notifier contains transport rejection. */
       .catch((error: unknown) => {
-        this.ctx.logger.warn(`acp: write-draft increment delivery failed: ${errorChain(error)}`)
+        this.ctx.logger.warn(`acp: assistant chunk delivery failed: ${errorChain(error)}`)
       })
       /* v8 ignore stop */
   }

@@ -139,12 +139,13 @@ describe('ACP prompt lifecycle', () => {
     expect(harness.updates).toEqual([])
   })
 
-  it('rejects a failed turn and never publishes its partial chunks', async () => {
+  it('rejects a failed turn after projecting its live text prefix', async () => {
     harness = await makeBridgeHarness({ script: [errorResponse('provider boom')] })
     const sessionId = await newSession(harness)
     await expect(harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] }))
       .rejects.toThrow(/turn failed: provider boom/)
-    expect(messageText(harness)).toBe('')
+    // Live text-delta is already on the wire; ACP has no retract for chunks.
+    expect(messageText(harness)).toBe('partial')
   })
 
   it('rejects an ordinary plugin failure through the same prompt boundary', async () => {
@@ -515,7 +516,8 @@ describe('ACP prompt lifecycle', () => {
     const sessionId = await newSession(harness)
     const result = await harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
     expect(result.stopReason).toBe('end_turn')
-    await vi.waitFor(() => { expect(messageText(harness!)).toBe('recovered') })
+    // Live prefix of the failed attempt stays; recovered deltas concatenate after it.
+    await vi.waitFor(() => { expect(messageText(harness!)).toBe('partialrecovered') })
   })
 
   it('a failed turn with no retry still rejects', async () => {
